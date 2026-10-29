@@ -68,10 +68,11 @@ func New(reg *registry.Store, base []string, opts ...Option) (*Proxy, error) {
 		}
 	}
 
-	d := &decider{reg: reg, base: slices.Clone(base), log: o.log}
+	d := &decider{reg: reg, base: slices.Clone(base)}
 	cfg := smokescreen.NewConfig()
 	cfg.Log.SetFormatter(&logrus.JSONFormatter{})
 	cfg.Log.AddHook(counterHook{})
+	cfg.Log.AddHook(decisionHook{o.log})
 	cfg.EgressACL = d
 	cfg.RoleFromRequest = d.role
 	cfg.IdleTimeout = idleTimeout
@@ -126,10 +127,34 @@ func (counterHook) Fire(e *logrus.Entry) error {
 	return nil
 }
 
+// decisionHook emits our one decision line per request from Smokescreen's
+// CANONICAL-PROXY-DECISION entry. That entry is written after the ACL check,
+// DNS resolution and the private-range check, so it carries the final outcome:
+// a request the ACL allowed but whose dial was refused or failed is a deny.
+type decisionHook struct{ log *slog.Logger }
+
+func (decisionHook) Levels() []logrus.Level { return logrus.AllLevels }
+
+func (h decisionHook) Fire(e *logrus.Entry) error {
+	if e.Message != smokescreen.CanonicalProxyDecision {
+		return nil
+	}
+	allowed, _ := e.Data[smokescreen.LogFieldAllow].(bool)
+	_, failed := e.Data[smokescreen.LogFieldError]
+	project, _ := e.Data[smokescreen.LogFieldProject].(string)
+	remote, _ := e.Data[smokescreen.LogFieldInRemoteAddr].(string)
+	host, _ := e.Data[smokescreen.LogFieldRequestedHost].(string)
+	ip := remote
+	if ap, err := netip.ParseAddrPort(remote); err == nil {
+		ip = ap.Addr().Unmap().String()
+	}
+	record(h.log, project, ip, host, allowed && !failed)
+	return nil
+}
+
 type decider struct {
 	reg  *registry.Store
 	base []string
-	log  *slog.Logger
 }
 
 // role maps the source address to the project registered for it. An unknown
@@ -141,14 +166,12 @@ func (d *decider) role(r *http.Request) (string, error) {
 			return e.Project, nil
 		}
 	}
-	d.record("", ip.String(), r.Host, false)
 	return "", errors.New("egress: source address is not a registered dev VM")
 }
 
 // Decide allows host if it is on the base list or the caller's project list.
 func (d *decider) Decide(a acl.DecideArgs) (acl.Decision, error) {
 	deny := func(project, why string) (acl.Decision, error) {
-		d.record(project, ipOf(a.Req), a.Host, false)
 		return acl.Decision{Result: acl.Deny, Reason: why, Project: project}, nil
 	}
 	ip, err := sourceIP(a.Req)
@@ -174,11 +197,10 @@ func (d *decider) Decide(a acl.DecideArgs) (acl.Decision, error) {
 	if err != nil {
 		return deny(e.Project, "acl error")
 	}
-	d.record(e.Project, ip.String(), a.Host, res.Result != acl.Deny)
 	return res, nil
 }
 
-func (d *decider) record(project, ip, host string, allow bool) {
+func record(log *slog.Logger, project, ip, host string, allow bool) {
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
@@ -186,7 +208,7 @@ func (d *decider) record(project, ip, host string, allow bool) {
 	if allow {
 		decision = "allow"
 	}
-	d.log.Info("egress", "project", project, "ip", ip, "host", host, "decision", decision)
+	log.Info("egress", "project", project, "ip", ip, "host", host, "decision", decision)
 }
 
 func sourceIP(r *http.Request) (netip.Addr, error) {
@@ -195,11 +217,4 @@ func sourceIP(r *http.Request) (netip.Addr, error) {
 		return netip.Addr{}, fmt.Errorf("egress: remote address %q: %w", r.RemoteAddr, err)
 	}
 	return ap.Addr().Unmap(), nil
-}
-
-func ipOf(r *http.Request) string {
-	if ip, err := sourceIP(r); err == nil {
-		return ip.String()
-	}
-	return ""
 }

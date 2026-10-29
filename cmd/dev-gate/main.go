@@ -53,6 +53,12 @@ func main() {
 }
 
 func run(ctx context.Context, configPath string) error {
+	// Register before anything slow: until then SIGHUP's default action kills
+	// the process, and a reload request can arrive while the listeners start.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
@@ -119,9 +125,6 @@ func run(ctx context.Context, configPath string) error {
 		}()
 	}
 
-	hup := make(chan os.Signal, 1)
-	signal.Notify(hup, syscall.SIGHUP)
-	defer signal.Stop(hup)
 	for {
 		select {
 		case <-hup:

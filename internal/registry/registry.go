@@ -128,6 +128,10 @@ type Store struct {
 	path string
 	mu   sync.RWMutex
 	byP  map[string]Entry
+
+	// afterRead, if set, runs in Reload between reading the file and swapping
+	// the map. Tests use it to interleave a concurrent change.
+	afterRead func()
 }
 
 // Open loads the registry at path. A missing file is an empty registry; a
@@ -141,14 +145,19 @@ func Open(path string) (*Store, error) {
 }
 
 // Reload re-reads the registry file. On any error the current state is kept.
+// The lock is held across the read and the swap, so a Put or Delete that saves
+// concurrently cannot be overwritten by an older snapshot of the file.
 func (s *Store) Reload() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	m, err := load(s.path)
 	if err != nil {
 		return err
 	}
-	s.mu.Lock()
+	if s.afterRead != nil {
+		s.afterRead()
+	}
 	s.byP = m
-	s.mu.Unlock()
 	return nil
 }
 

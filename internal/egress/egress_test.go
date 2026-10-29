@@ -31,6 +31,9 @@ func (stubResolver) LookupPort(_ context.Context, _, service string) (int, error
 	return net.LookupPort("tcp", service)
 }
 func (stubResolver) LookupIP(_ context.Context, _, host string) ([]net.IP, error) {
+	if host == "nxdomain.test" {
+		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+	}
 	if host == "private.test" {
 		return []net.IP{net.ParseIP("10.1.2.3")}, nil
 	}
@@ -73,7 +76,7 @@ func newEnv(t *testing.T, register bool) *env {
 
 	logs := &bytes.Buffer{}
 	_, lo, _ := net.ParseCIDR("127.0.0.0/8")
-	p, err := New(reg, []string{"base.test", "*.wild.test"},
+	p, err := New(reg, []string{"base.test", "*.wild.test", "private.test", "nxdomain.test"},
 		WithLogger(slog.New(slog.NewJSONHandler(logs, nil))),
 		WithResolver(stubResolver{}),
 		WithAllowRanges([]smokescreen.RuleRange{{Net: *lo}}))
@@ -232,5 +235,54 @@ func TestEgressRefusesClientChosenUpstreamProxy(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusProxyAuthRequired {
 		t.Fatalf("status = %d, want 407", resp.StatusCode)
+	}
+}
+
+// decisions parses the JSON decision lines written by the proxy's logger.
+func (e *env) decisions(t *testing.T) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(e.logs.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var r map[string]any
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func TestEgressLogsFinalOutcomeNotACLVerdict(t *testing.T) {
+	// Both names pass the ACL; the connection is then refused (private
+	// address) or fails (no DNS answer). The log must say deny, once.
+	for _, host := range []string{"private.test", "nxdomain.test"} {
+		for _, via := range []string{"http", "connect"} {
+			e := newEnv(t, true)
+			if via == "http" {
+				if code, _ := e.get(t, host); code == 200 {
+					t.Fatalf("%s via %s: reached origin", host, via)
+				}
+			} else if code := e.connect(t, host); code == 200 {
+				t.Fatalf("%s via %s: tunnel established", host, via)
+			}
+			got := e.decisions(t)
+			if len(got) != 1 || got[0]["decision"] != "deny" || got[0]["host"] != host ||
+				got[0]["project"] != "p" || got[0]["ip"] != "127.0.0.1" {
+				t.Errorf("%s via %s: logs = %v", host, via, got)
+			}
+		}
+	}
+}
+
+func TestEgressLogsOneAllowLinePerRequest(t *testing.T) {
+	e := newEnv(t, true)
+	e.get(t, "base.test")
+	e.connect(t, "base.test")
+	got := e.decisions(t)
+	if len(got) != 2 || got[0]["decision"] != "allow" || got[1]["decision"] != "allow" {
+		t.Fatalf("logs = %v", got)
 	}
 }

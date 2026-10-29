@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func entry(project, ip, token string, repos ...string) Entry {
@@ -245,5 +246,40 @@ func TestReloadPicksUpEditsAndKeepsStateOnError(t *testing.T) {
 	}
 	if len(s.List()) != 2 {
 		t.Fatal("state lost after failed reload")
+	}
+}
+
+// A Delete that lands between Reload's read and its swap must not be undone by
+// the stale snapshot: a revoked project would come back.
+func TestReloadDoesNotLoseConcurrentDelete(t *testing.T) {
+	s, path := open(t)
+	if err := s.Put(entry("p", "192.168.5.10", "tok", "o/r")); err != nil {
+		t.Fatal(err)
+	}
+	deleted := make(chan struct{})
+	s.afterRead = func() {
+		go func() {
+			defer close(deleted)
+			if err := s.Delete("p"); err != nil {
+				t.Error(err)
+			}
+		}()
+		// Without the lock the Delete finishes inside this window and the
+		// swap below would resurrect "p". With it, Delete waits for Reload.
+		select {
+		case <-deleted:
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	<-deleted
+	if got := s.List(); len(got) != 0 {
+		t.Fatalf("deleted project resurrected: %+v", got)
+	}
+	onDisk, err := Open(path)
+	if err != nil || len(onDisk.List()) != 0 {
+		t.Fatalf("file disagrees: %v %v", err, onDisk.List())
 	}
 }
