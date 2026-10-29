@@ -231,6 +231,12 @@ func splitRepo(repo string) (owner, name string, err error) {
 	return owner, name, nil
 }
 
+// ValidRepo reports whether repo is a well-formed "owner/name".
+func ValidRepo(repo string) bool {
+	_, _, err := splitRepo(repo)
+	return err == nil
+}
+
 func validName(s string) bool {
 	if s == "" || s == "." || s == ".." {
 		return false
