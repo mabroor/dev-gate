@@ -141,7 +141,8 @@ func (p *proxy) rpc(w http.ResponseWriter, r *http.Request, e registry.Entry, re
 	}
 
 	// Anything but an identity-encoded body would hide the commands from us.
-	if enc := r.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+	// Every Content-Encoding value counts: a second header must not slip past.
+	if !identityEncoded(r.Header.Values("Content-Encoding")) {
 		http.Error(w, "content-encoding not supported for push", http.StatusUnsupportedMediaType)
 		return
 	}
@@ -179,6 +180,10 @@ func (p *proxy) forward(w http.ResponseWriter, r *http.Request, e registry.Entry
 		req.ContentLength = r.ContentLength
 	}
 	for _, h := range requestHeaders {
+		// Push bodies are forwarded as parsed, so no encoding header goes with them.
+		if h == "Content-Encoding" && endpoint == receivePack {
+			continue
+		}
 		if v := r.Header.Values(h); len(v) > 0 {
 			req.Header[http.CanonicalHeaderKey(h)] = append([]string(nil), v...)
 		}
@@ -223,6 +228,18 @@ func (f flushWriter) Write(b []byte) (int, error) {
 	n, err := f.w.Write(b)
 	_ = f.rc.Flush()
 	return n, err
+}
+
+// identityEncoded reports whether the Content-Encoding values, if any, are
+// exactly one "identity".
+func identityEncoded(values []string) bool {
+	switch len(values) {
+	case 0:
+		return true
+	case 1:
+		return strings.EqualFold(strings.TrimSpace(values[0]), "identity")
+	}
+	return false
 }
 
 func clientIP(r *http.Request) (netip.Addr, error) {

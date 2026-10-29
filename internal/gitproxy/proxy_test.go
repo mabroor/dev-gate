@@ -26,8 +26,8 @@ const (
 )
 
 type upReq struct {
-	Method, Path, RawQuery, Auth, Cookie, ContentType string
-	Body                                              []byte
+	Method, Path, RawQuery, Auth, Cookie, ContentType, ContentEncoding string
+	Body                                                               []byte
 }
 
 type upstream struct {
@@ -43,7 +43,7 @@ func newUpstream(t *testing.T) *upstream {
 		b, _ := io.ReadAll(r.Body)
 		u.mu.Lock()
 		u.reqs = append(u.reqs, upReq{r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Get("Authorization"),
-			r.Header.Get("Cookie"), r.Header.Get("Content-Type"), b})
+			r.Header.Get("Cookie"), r.Header.Get("Content-Type"), r.Header.Get("Content-Encoding"), b})
 		redirect := u.redirect
 		u.mu.Unlock()
 		if redirect {
@@ -261,6 +261,26 @@ func TestGitProxyRejectsMalformedAndEncodedPush(t *testing.T) {
 	}
 }
 
+func TestGitProxyRejectsDuplicateContentEncodingOnPush(t *testing.T) {
+	e := newEnv(t, "127.0.0.1")
+	req, _ := http.NewRequest("POST", e.proxy.URL+"/acme/widgets.git/git-receive-pack",
+		strings.NewReader(pushBody("refs/heads/agent/x")))
+	req.SetBasicAuth("x", vmToken)
+	req.Header.Add("Content-Encoding", "identity")
+	req.Header.Add("Content-Encoding", "deflate")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("status = %d, want 415", resp.StatusCode)
+	}
+	if e.up.count() != 0 {
+		t.Fatal("request reached upstream")
+	}
+}
+
 func TestGitProxyPushToAgentForwardsWholeBody(t *testing.T) {
 	e := newEnv(t, "127.0.0.1")
 	body := pushBody("refs/heads/agent/feature")
@@ -275,6 +295,9 @@ func TestGitProxyPushToAgentForwardsWholeBody(t *testing.T) {
 	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:ghs_write"))
 	if e.up.reqs[0].Auth != want {
 		t.Errorf("Authorization = %q", e.up.reqs[0].Auth)
+	}
+	if e.up.reqs[0].ContentEncoding != "" {
+		t.Errorf("Content-Encoding forwarded on push: %q", e.up.reqs[0].ContentEncoding)
 	}
 	if e.up.reqs[0].ContentType != "application/x-git-receive-pack-request" {
 		t.Errorf("content-type = %q", e.up.reqs[0].ContentType)
