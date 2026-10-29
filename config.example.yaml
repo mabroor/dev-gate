@@ -1,0 +1,55 @@
+# /etc/dev-gate/config.yaml
+listen:
+  git: ":8443"     # git smart-HTTP proxy and POST /pr (TLS)
+  admin: ":9443"   # admin API (TLS)
+  egress: ":3128"  # forward proxy, CONNECT and plain HTTP (no TLS)
+  # Firewalling of who may reach which port happens outside this process.
+  # The egress role comes only from the connection's source IP.
+
+tls:
+  cert: /etc/dev-gate/tls/cert.pem
+  key: /etc/dev-gate/tls/key.pem
+
+github_app:
+  id: "000000"
+  key_file: /etc/dev-gate/app-key.pem
+
+# File holding the admin bearer token (at least 32 characters).
+admin_token_file: /etc/dev-gate/admin-token
+
+registry_path: /var/lib/dev-gate/registry.json
+
+# Hosts every dev VM may reach. Each project adds its own egress_extra on top.
+# Destinations that resolve to private, loopback or link-local addresses are
+# refused regardless of this list.
+egress_base_allow:
+  # Rust
+  - crates.io
+  - index.crates.io
+  - static.crates.io
+  - static.rust-lang.org
+  # npm, PyPI
+  - registry.npmjs.org
+  - pypi.org
+  - files.pythonhosted.org
+  # Container registries
+  - registry-1.docker.io
+  - auth.docker.io
+  - production.cloudflare.docker.com
+  - ghcr.io
+  - pkg-containers.githubusercontent.com
+  - public.ecr.aws
+  # OS packages
+  - archive.ubuntu.com
+  - security.ubuntu.com
+  - storage.googleapis.com
+  # GitHub (git itself goes through the git proxy)
+  - github.com
+  - codeload.github.com
+  - objects.githubusercontent.com
+  # Anthropic -- confirmed by the Task 2 measurement
+  - api.anthropic.com
+  - claude.ai
+  - statsig.anthropic.com
+  # PostHog -- confirmed by the Task 2 measurement
+  - us.i.posthog.com

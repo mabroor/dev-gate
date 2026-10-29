@@ -48,24 +48,31 @@ type proxy struct {
 	reg      *registry.Store
 	mint     TokenSource
 	upstream *url.URL
+	api      *url.URL
 	client   *http.Client
 }
 
 // Handler serves /<owner>/<repo>[.git]/{info/refs,git-upload-pack,git-receive-pack}
 // by proxying to upstream (https://github.com in production).
-func Handler(reg *registry.Store, mint TokenSource, upstream *url.URL) http.Handler {
+// It also serves POST /pr (see pr.go).
+func Handler(reg *registry.Store, mint TokenSource, upstream *url.URL, opts ...Option) http.Handler {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.ResponseHeaderTimeout = 0 // receive-pack answers only after the whole pack arrives
-	return &proxy{
+	p := &proxy{
 		reg:      reg,
 		mint:     mint,
 		upstream: upstream,
+		api:      &url.URL{Scheme: "https", Host: "api.github.com"},
 		client: &http.Client{
 			Transport: tr,
 			// Never follow redirects: a redirect would carry our token elsewhere.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}
+	for _, o := range opts {
+		o(p)
+	}
+	return p
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -91,6 +98,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.URL.Path == "/pr" {
+		p.pr(w, r, entry)
+		return
+	}
 	repo, endpoint, ok := parsePath(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
