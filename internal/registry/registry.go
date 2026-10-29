@@ -12,9 +12,74 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"strings"
 	"sync"
+
+	"github.com/mabroor/dev-gate/internal/ghapp"
 )
+
+// ErrInvalid marks an entry that is malformed; ErrConflict one that collides
+// with another project's IP or token.
+var (
+	ErrInvalid  = errors.New("registry: invalid entry")
+	ErrConflict = errors.New("registry: conflicts with another project")
+)
+
+var (
+	projectRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,30}$`)
+	hostRE    = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
+)
+
+// ValidProject reports whether name is an acceptable project name.
+func ValidProject(name string) bool { return projectRE.MatchString(name) }
+
+// validEgressHost accepts a lowercase hostname of at least two labels, with an
+// optional leading "*." wildcard.
+func validEgressHost(h string) bool {
+	return len(h) <= 253 && hostRE.MatchString(strings.TrimPrefix(h, "*."))
+}
+
+func validate(e Entry) error {
+	switch {
+	case !ValidProject(e.Project):
+		return fmt.Errorf("%w: bad project name", ErrInvalid)
+	case !e.VMIP.IsValid():
+		return fmt.Errorf("%w: bad vm ip", ErrInvalid)
+	case e.TokenSHA256 == [32]byte{}:
+		return fmt.Errorf("%w: no token hash", ErrInvalid)
+	case len(e.Repos) == 0:
+		return fmt.Errorf("%w: no repos", ErrInvalid)
+	}
+	for _, r := range e.Repos {
+		if !ghapp.ValidRepo(r) {
+			return fmt.Errorf("%w: bad repo %q", ErrInvalid, r)
+		}
+	}
+	for _, h := range e.EgressExtra {
+		if !validEgressHost(h) {
+			return fmt.Errorf("%w: bad egress host %q", ErrInvalid, h)
+		}
+	}
+	return nil
+}
+
+// checkConflict reports a collision between e and any other project in m.
+func checkConflict(m map[string]Entry, e Entry) error {
+	for p, o := range m {
+		if p == e.Project {
+			continue
+		}
+		if o.VMIP == e.VMIP {
+			return fmt.Errorf("%w: ip %s belongs to project %q", ErrConflict, e.VMIP, p)
+		}
+		if o.TokenSHA256 == e.TokenSHA256 {
+			return fmt.Errorf("%w: token already used by project %q", ErrConflict, p)
+		}
+	}
+	return nil
+}
 
 // Entry is one project's dev VM.
 type Entry struct {
@@ -63,15 +128,44 @@ type Store struct {
 	path string
 	mu   sync.RWMutex
 	byP  map[string]Entry
+
+	// afterRead, if set, runs in Reload between reading the file and swapping
+	// the map. Tests use it to interleave a concurrent change.
+	afterRead func()
 }
 
 // Open loads the registry at path. A missing file is an empty registry; a
-// corrupt one is an error.
+// corrupt or inconsistent one is an error.
 func Open(path string) (*Store, error) {
-	s := &Store{path: path, byP: map[string]Entry{}}
+	m, err := load(path)
+	if err != nil {
+		return nil, err
+	}
+	return &Store{path: path, byP: m}, nil
+}
+
+// Reload re-reads the registry file. On any error the current state is kept.
+// The lock is held across the read and the swap, so a Put or Delete that saves
+// concurrently cannot be overwritten by an older snapshot of the file.
+func (s *Store) Reload() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, err := load(s.path)
+	if err != nil {
+		return err
+	}
+	if s.afterRead != nil {
+		s.afterRead()
+	}
+	s.byP = m
+	return nil
+}
+
+func load(path string) (map[string]Entry, error) {
+	m := map[string]Entry{}
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return s, nil
+		return m, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("registry: %w", err)
@@ -81,25 +175,33 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("registry: parsing %s: %w", path, err)
 	}
 	for _, e := range entries {
-		s.byP[e.Project] = e
+		if err := validate(e); err != nil {
+			return nil, fmt.Errorf("registry: %s: project %q: %w", path, e.Project, err)
+		}
+		e.VMIP = e.VMIP.Unmap()
+		if _, dup := m[e.Project]; dup {
+			return nil, fmt.Errorf("registry: %s: duplicate project %q", path, e.Project)
+		}
+		if err := checkConflict(m, e); err != nil {
+			return nil, fmt.Errorf("registry: %s: project %q: %w", path, e.Project, err)
+		}
+		m[e.Project] = e.clone()
 	}
-	return s, nil
+	return m, nil
 }
 
 // Put adds or replaces the entry for e.Project.
 func (s *Store) Put(e Entry) error {
-	if e.Project == "" || !e.VMIP.IsValid() || len(e.Repos) == 0 {
-		return errors.New("registry: entry needs project, vm ip and repos")
+	if err := validate(e); err != nil {
+		return err
 	}
 	e = e.clone()
 	e.VMIP = e.VMIP.Unmap()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for p, o := range s.byP {
-		if p != e.Project && o.VMIP == e.VMIP {
-			return fmt.Errorf("registry: ip %s already belongs to project %q", e.VMIP, p)
-		}
+	if err := checkConflict(s.byP, e); err != nil {
+		return err
 	}
 	prev, had := s.byP[e.Project]
 	s.byP[e.Project] = e
@@ -128,6 +230,22 @@ func (s *Store) Delete(project string) error {
 		return err
 	}
 	return nil
+}
+
+// List returns copies of all entries, sorted by project.
+func (s *Store) List() []Entry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sortedLocked()
+}
+
+func (s *Store) sortedLocked() []Entry {
+	entries := make([]Entry, 0, len(s.byP))
+	for _, e := range s.byP {
+		entries = append(entries, e.clone())
+	}
+	slices.SortFunc(entries, func(a, b Entry) int { return strings.Compare(a.Project, b.Project) })
+	return entries
 }
 
 // ByToken returns the entry whose token matches and whose VM has address ip.
@@ -181,19 +299,7 @@ func (s *Store) ByIP(ip netip.Addr) (Entry, bool) {
 
 // saveLocked writes the registry to a 0600 temp file and renames it into place.
 func (s *Store) saveLocked() error {
-	entries := make([]Entry, 0, len(s.byP))
-	for _, e := range s.byP {
-		entries = append(entries, e)
-	}
-	slices.SortFunc(entries, func(a, b Entry) int {
-		switch {
-		case a.Project < b.Project:
-			return -1
-		case a.Project > b.Project:
-			return 1
-		}
-		return 0
-	})
+	entries := s.sortedLocked()
 	b, err := json.MarshalIndent(entries, "", "  ")
 	if err != nil {
 		return err
