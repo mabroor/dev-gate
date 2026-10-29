@@ -2,9 +2,12 @@ package registry
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -138,5 +141,109 @@ func TestReturnedEntriesAreCopies(t *testing.T) {
 	e2, _ := s.ByIP(netip.MustParseAddr("192.168.5.10"))
 	if e2.Repos[0] != "o/r" {
 		t.Fatal("store state mutated through returned entry")
+	}
+}
+
+func TestPutRejectsMalformedEntries(t *testing.T) {
+	s, _ := open(t)
+	bad := map[string]Entry{
+		"repo without owner":   entry("p", "192.168.5.10", "t", "justname"),
+		"repo with extra":      entry("p", "192.168.5.10", "t", "o/r/x"),
+		"repo with space":      entry("p", "192.168.5.10", "t", "o/r r"),
+		"repo dot-dot":         entry("p", "192.168.5.10", "t", "o/.."),
+		"project uppercase":    entry("P", "192.168.5.10", "t", "o/r"),
+		"project with slash":   entry("a/b", "192.168.5.10", "t", "o/r"),
+		"project leading dash": entry("-a", "192.168.5.10", "t", "o/r"),
+		"bad egress host":      {Project: "p", VMIP: netip.MustParseAddr("192.168.5.10"), Repos: []string{"o/r"}, EgressExtra: []string{"*"}},
+		"egress with scheme":   {Project: "p", VMIP: netip.MustParseAddr("192.168.5.10"), Repos: []string{"o/r"}, EgressExtra: []string{"https://x.com"}},
+	}
+	for name, e := range bad {
+		if err := s.Put(e); !errors.Is(err, ErrInvalid) {
+			t.Errorf("%s: err = %v, want ErrInvalid", name, err)
+		}
+	}
+	if len(s.List()) != 0 {
+		t.Fatal("rejected entries were stored")
+	}
+}
+
+func TestPutRejectsTokenHashUsedByAnotherProject(t *testing.T) {
+	s, _ := open(t)
+	if err := s.Put(entry("p", "192.168.5.10", "same", "o/r")); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Put(entry("q", "192.168.5.11", "same", "o/q"))
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("err = %v, want ErrConflict", err)
+	}
+	if err := s.Put(entry("p", "192.168.5.10", "same", "o/r")); err != nil {
+		t.Fatalf("re-put of same project: %v", err)
+	}
+}
+
+func TestPutIPConflictIsErrConflict(t *testing.T) {
+	s, _ := open(t)
+	_ = s.Put(entry("p", "192.168.5.10", "a", "o/r"))
+	if err := s.Put(entry("q", "192.168.5.10", "b", "o/q")); !errors.Is(err, ErrConflict) {
+		t.Fatalf("err = %v, want ErrConflict", err)
+	}
+}
+
+func TestOpenRejectsInvalidAndDuplicateEntries(t *testing.T) {
+	dir := t.TempDir()
+	h1 := hex.EncodeToString(func() []byte { s := sha256.Sum256([]byte("a")); return s[:] }())
+	h2 := hex.EncodeToString(func() []byte { s := sha256.Sum256([]byte("b")); return s[:] }())
+	cases := map[string]string{
+		"duplicate project": `[{"project":"p","vm_ip":"192.168.5.10","token_sha256":"` + h1 + `","repos":["o/r"]},
+			{"project":"p","vm_ip":"192.168.5.11","token_sha256":"` + h2 + `","repos":["o/r"]}]`,
+		"duplicate ip": `[{"project":"p","vm_ip":"192.168.5.10","token_sha256":"` + h1 + `","repos":["o/r"]},
+			{"project":"q","vm_ip":"192.168.5.10","token_sha256":"` + h2 + `","repos":["o/r"]}]`,
+		"duplicate token": `[{"project":"p","vm_ip":"192.168.5.10","token_sha256":"` + h1 + `","repos":["o/r"]},
+			{"project":"q","vm_ip":"192.168.5.11","token_sha256":"` + h1 + `","repos":["o/r"]}]`,
+		"bad repo": `[{"project":"p","vm_ip":"192.168.5.10","token_sha256":"` + h1 + `","repos":["nope"]}]`,
+	}
+	for name, body := range cases {
+		path := filepath.Join(dir, strings.ReplaceAll(name, " ", "_")+".json")
+		_ = os.WriteFile(path, []byte(body), 0o600)
+		if _, err := Open(path); err == nil {
+			t.Errorf("%s: Open succeeded", name)
+		}
+	}
+}
+
+func TestListOmitsNothingButIsSortedAndCopied(t *testing.T) {
+	s, _ := open(t)
+	_ = s.Put(entry("b", "192.168.5.11", "b", "o/b"))
+	_ = s.Put(entry("a", "192.168.5.10", "a", "o/a"))
+	l := s.List()
+	if len(l) != 2 || l[0].Project != "a" || l[1].Project != "b" {
+		t.Fatalf("List = %+v", l)
+	}
+	l[0].Repos[0] = "evil/x"
+	if s.List()[0].Repos[0] != "o/a" {
+		t.Fatal("List leaked internal slice")
+	}
+}
+
+func TestReloadPicksUpEditsAndKeepsStateOnError(t *testing.T) {
+	s, path := open(t)
+	_ = s.Put(entry("p", "192.168.5.10", "a", "o/r"))
+	other, _ := Open(path)
+	_ = other.Put(entry("q", "192.168.5.11", "b", "o/q"))
+	if _, ok := s.ByIP(netip.MustParseAddr("192.168.5.11")); ok {
+		t.Fatal("saw q before reload")
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.ByIP(netip.MustParseAddr("192.168.5.11")); !ok {
+		t.Fatal("q missing after reload")
+	}
+	_ = os.WriteFile(path, []byte("{broken"), 0o600)
+	if err := s.Reload(); err == nil {
+		t.Fatal("reload of corrupt file succeeded")
+	}
+	if len(s.List()) != 2 {
+		t.Fatal("state lost after failed reload")
 	}
 }
