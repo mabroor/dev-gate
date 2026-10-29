@@ -221,5 +221,22 @@ func (s *Store) saveLocked() error {
 	if err := os.Rename(tmp.Name(), s.path); err != nil {
 		return fmt.Errorf("registry: %w", err)
 	}
+	// Without the directory fsync a power loss can undo the rename, and with
+	// it a DELETE.
+	if err := syncDir(filepath.Dir(s.path)); err != nil {
+		return fmt.Errorf("registry: %w", err)
+	}
 	return nil
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return err
+	}
+	return d.Close()
 }
