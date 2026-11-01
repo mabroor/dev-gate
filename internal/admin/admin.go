@@ -57,6 +57,7 @@ type putRequest struct {
 	TokenSHA256 string   `json:"token_sha256"`
 	Repos       []string `json:"repos"`
 	EgressExtra []string `json:"egress_extra"`
+	EgressOpen  bool     `json:"egress_open"`
 }
 
 func (h *handler) put(w http.ResponseWriter, r *http.Request) {
@@ -79,12 +80,12 @@ func (h *handler) put(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "token_sha256 must be 64 hex characters", http.StatusBadRequest)
 		return
 	}
-	e := registry.Entry{Project: project, VMIP: ip.Unmap(), Repos: in.Repos, EgressExtra: in.EgressExtra}
+	e := registry.Entry{Project: project, VMIP: ip.Unmap(), Repos: in.Repos, EgressExtra: in.EgressExtra, EgressOpen: in.EgressOpen}
 	copy(e.TokenSHA256[:], hash)
 
 	switch err := h.reg.Put(e); {
 	case err == nil:
-		slog.Info("admin: project registered", "project", project, "ip", e.VMIP, "repos", len(e.Repos))
+		slog.Info("admin: project registered", "project", project, "ip", e.VMIP, "repos", len(e.Repos), "egress_open", e.EgressOpen)
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, registry.ErrInvalid):
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -112,13 +113,14 @@ type listItem struct {
 	VMIP        string   `json:"vm_ip"`
 	Repos       []string `json:"repos"`
 	EgressExtra []string `json:"egress_extra"`
+	EgressOpen  bool     `json:"egress_open"`
 }
 
 func (h *handler) list(w http.ResponseWriter, _ *http.Request) {
 	entries := h.reg.List()
 	out := make([]listItem, 0, len(entries))
 	for _, e := range entries {
-		out = append(out, listItem{e.Project, e.VMIP.String(), orEmpty(e.Repos), orEmpty(e.EgressExtra)})
+		out = append(out, listItem{e.Project, e.VMIP.String(), orEmpty(e.Repos), orEmpty(e.EgressExtra), e.EgressOpen})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)

@@ -283,3 +283,42 @@ func TestReloadDoesNotLoseConcurrentDelete(t *testing.T) {
 		t.Fatalf("file disagrees: %v %v", err, onDisk.List())
 	}
 }
+
+func TestRegistryPersistsEgressOpen(t *testing.T) {
+	s, path := open(t)
+	e := entry("p", "192.168.5.10", "tok", "o/r")
+	e.EgressOpen = true
+	if err := s.Put(e); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(entry("q", "192.168.5.11", "tok2", "o/s")); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := s2.ByIP(netip.MustParseAddr("192.168.5.10")); !p.EgressOpen {
+		t.Fatal("egress_open lost on reload")
+	}
+	if q, _ := s2.ByIP(netip.MustParseAddr("192.168.5.11")); q.EgressOpen {
+		t.Fatal("egress_open set on a project that did not ask for it")
+	}
+}
+
+func TestOpenReadsRegistryWithoutEgressOpen(t *testing.T) {
+	// Registries written before egress_open existed load as closed.
+	path := filepath.Join(t.TempDir(), "r.json")
+	old := `[{"project":"p","vm_ip":"192.168.5.10","token_sha256":"` + strings.Repeat("ab", 32) +
+		`","repos":["o/r"],"egress_extra":[]}]`
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, ok := s.ByIP(netip.MustParseAddr("192.168.5.10")); !ok || p.EgressOpen {
+		t.Fatalf("ok=%v e=%+v", ok, p)
+	}
+}

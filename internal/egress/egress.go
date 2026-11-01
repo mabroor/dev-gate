@@ -55,7 +55,7 @@ type Proxy struct {
 }
 
 // New builds a proxy whose ACL is base plus each project's EgressExtra,
-// default deny, read from reg on every decision so admin changes apply at once.
+// default deny (default allow for a project with EgressOpen), read from reg on every decision so admin changes apply at once.
 func New(reg *registry.Store, base []string, opts ...Option) (*Proxy, error) {
 	o := options{log: slog.Default()}
 	for _, f := range opts {
@@ -184,9 +184,16 @@ func (d *decider) Decide(a acl.DecideArgs) (acl.Decision, error) {
 	if !ok || e.Project != a.Service {
 		return deny("", "source address is not a registered dev VM")
 	}
+	// An open project allows any host; Smokescreen still refuses private
+	// addresses after this decision, and Open still denies a client-chosen
+	// upstream proxy.
+	policy := acl.Enforce
+	if e.EgressOpen {
+		policy = acl.Open
+	}
 	rule := acl.Rule{
 		Project:     e.Project,
-		Policy:      acl.Enforce,
+		Policy:      policy,
 		DomainGlobs: append(slices.Clone(d.base), e.EgressExtra...),
 	}
 	res, err := (&acl.ACL{Rules: map[string]acl.Rule{e.Project: rule}}).Decide(acl.DecideArgs{

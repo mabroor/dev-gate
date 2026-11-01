@@ -19,7 +19,8 @@ admin_token_file: /etc/dev-gate/admin-token
 
 registry_path: /var/lib/dev-gate/registry.json
 
-# Hosts every dev VM may reach. Each project adds its own egress_extra on top.
+# Hosts every dev VM may reach. Each project adds its own egress_extra on top;
+# a project registered with egress_open may reach any public host instead.
 # Destinations that resolve to private, loopback or link-local addresses are
 # refused regardless of this list.
 egress_base_allow:
