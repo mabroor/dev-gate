@@ -47,9 +47,14 @@ egress_base_allow:
   - github.com
   - codeload.github.com
   - objects.githubusercontent.com
-  # Anthropic -- confirmed by the Task 2 measurement
+  # Anthropic (code.claude.com/docs/en/network-config): API, claude.ai sign-in
+  # (claude.com redirects to claude.ai; platform.claude.com does the OAuth token
+  # exchange and refresh) and native updates. mcp-proxy.anthropic.com stays off:
+  # claude.ai connectors would reach the owner's account data from the sandbox.
   - api.anthropic.com
   - claude.ai
-  - statsig.anthropic.com
-  # PostHog -- confirmed by the Task 2 measurement
+  - claude.com
+  - platform.claude.com
+  - downloads.claude.ai
+  # PostHog -- placeholder until measured
   - us.i.posthog.com
