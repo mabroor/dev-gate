@@ -286,3 +286,91 @@ func TestEgressLogsOneAllowLinePerRequest(t *testing.T) {
 		t.Fatalf("logs = %v", got)
 	}
 }
+
+// newOpenEnv is newEnv's proxy rebuilt with p (127.0.0.1) and q as given:
+// openP/openQ set each project's EgressOpen.
+func newOpenEnv(t *testing.T, openP, openQ bool) *env {
+	t.Helper()
+	e := newEnv(t, true)
+	reg, err := registry.Open(filepath.Join(t.TempDir(), "open.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, x := range []struct {
+		project, ip string
+		open        bool
+	}{{"p", "127.0.0.1", openP}, {"q", "127.0.0.2", openQ}} {
+		if err := reg.Put(registry.Entry{Project: x.project, VMIP: netip.MustParseAddr(x.ip),
+			TokenSHA256: sha256.Sum256([]byte(x.project)), Repos: []string{"a/b"}, EgressOpen: x.open}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, lo, _ := net.ParseCIDR("127.0.0.0/8")
+	p, err := New(reg, []string{"base.test"}, WithResolver(stubResolver{}),
+		WithLogger(slog.New(slog.NewJSONHandler(e.logs, nil))),
+		WithAllowRanges([]smokescreen.RuleRange{{Net: *lo}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+	srv := httptest.NewServer(p.Handler())
+	t.Cleanup(srv.Close)
+	e.proxy = srv
+	return e
+}
+
+func TestEgressOpenProjectAllowsAnyPublicHost(t *testing.T) {
+	e := newOpenEnv(t, true, false)
+	for _, host := range []string{"unlisted.test", "base.test"} {
+		if code, body := e.get(t, host); code != 200 || body != "origin-ok" {
+			t.Errorf("HTTP %s: %d %q", host, code, body)
+		}
+		if code := e.connect(t, host); code != 200 {
+			t.Errorf("CONNECT %s: %d", host, code)
+		}
+	}
+}
+
+func TestEgressOpenIsPerProject(t *testing.T) {
+	// q is open; the requests come from p, which is not.
+	e := newOpenEnv(t, false, true)
+	if code := e.connect(t, "unlisted.test"); code != http.StatusProxyAuthRequired {
+		t.Fatalf("CONNECT unlisted.test from a closed project: %d, want 407", code)
+	}
+}
+
+func TestEgressOpenProjectStillDeniesPrivateAddresses(t *testing.T) {
+	e := newOpenEnv(t, true, false)
+	if code := e.connect(t, "private.test"); code == 200 {
+		t.Fatal("open project tunnelled to a private address")
+	}
+}
+
+func TestEgressOpenProjectStillRefusesClientChosenUpstreamProxy(t *testing.T) {
+	e := newOpenEnv(t, true, false)
+	_, port, _ := net.SplitHostPort(strings.TrimPrefix(e.origin.URL, "http://"))
+	conn, err := net.Dial("tcp", strings.TrimPrefix(e.proxy.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "CONNECT unlisted.test:%s HTTP/1.1\r\nHost: unlisted.test:%s\r\nX-Upstream-Https-Proxy: https://evil.test:443\r\n\r\n", port, port)
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusProxyAuthRequired {
+		t.Fatalf("status = %d, want 407", resp.StatusCode)
+	}
+}
+
+func TestEgressOpenDecisionsAreLogged(t *testing.T) {
+	e := newOpenEnv(t, true, false)
+	e.get(t, "unlisted.test")
+	for _, d := range e.decisions(t) {
+		if d["host"] == "unlisted.test" && d["decision"] == "allow" && d["project"] == "p" {
+			return
+		}
+	}
+	t.Fatalf("no allow decision logged for unlisted.test: %s", e.logs.String())
+}

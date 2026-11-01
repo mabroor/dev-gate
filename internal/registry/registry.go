@@ -88,6 +88,9 @@ type Entry struct {
 	TokenSHA256 [32]byte
 	Repos       []string // "owner/repo"
 	EgressExtra []string
+	// EgressOpen lets the project's VM reach any public host, not just the
+	// allowlist. Private, loopback and link-local addresses stay refused.
+	EgressOpen bool
 }
 
 // wire is the on-disk form; the token hash is hex rather than a number array.
@@ -97,10 +100,11 @@ type wire struct {
 	TokenSHA256 string     `json:"token_sha256"`
 	Repos       []string   `json:"repos"`
 	EgressExtra []string   `json:"egress_extra"`
+	EgressOpen  bool       `json:"egress_open,omitempty"`
 }
 
 func (e Entry) MarshalJSON() ([]byte, error) {
-	return json.Marshal(wire{e.Project, e.VMIP, hex.EncodeToString(e.TokenSHA256[:]), e.Repos, e.EgressExtra})
+	return json.Marshal(wire{e.Project, e.VMIP, hex.EncodeToString(e.TokenSHA256[:]), e.Repos, e.EgressExtra, e.EgressOpen})
 }
 
 func (e *Entry) UnmarshalJSON(b []byte) error {
@@ -112,7 +116,7 @@ func (e *Entry) UnmarshalJSON(b []byte) error {
 	if err != nil || len(h) != sha256.Size {
 		return errors.New("registry: bad token_sha256")
 	}
-	*e = Entry{Project: w.Project, VMIP: w.VMIP, Repos: w.Repos, EgressExtra: w.EgressExtra}
+	*e = Entry{Project: w.Project, VMIP: w.VMIP, Repos: w.Repos, EgressExtra: w.EgressExtra, EgressOpen: w.EgressOpen}
 	copy(e.TokenSHA256[:], h)
 	return nil
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -191,5 +192,25 @@ func TestNewRejectsEmptyToken(t *testing.T) {
 	reg, _ := registry.Open(filepath.Join(t.TempDir(), "r.json"))
 	if _, err := New(reg, ""); err == nil {
 		t.Fatal("empty admin token accepted")
+	}
+}
+
+func TestAdminPutAndListEgressOpen(t *testing.T) {
+	e := newEnv(t)
+	body := `{"vm_ip":"10.0.0.2","token_sha256":"` + tokHash(vmTok) + `","repos":["acme/widgets"],"egress_extra":[],"egress_open":true}`
+	if resp := e.req(t, "PUT", "/admin/projects/p", adminTok, body); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("PUT status %d", resp.StatusCode)
+	}
+	e.req(t, "PUT", "/admin/projects/q", adminTok, putBody("10.0.0.3", "other"))
+	if p, _ := e.reg.ByIP(netip.MustParseAddr("10.0.0.2")); !p.EgressOpen {
+		t.Fatal("egress_open not stored")
+	}
+	resp := e.req(t, "GET", "/admin/projects", adminTok, "")
+	var out []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || len(out) != 2 {
+		t.Fatalf("list: %v %v", out, err)
+	}
+	if out[0]["egress_open"] != true || out[1]["egress_open"] != false {
+		t.Fatalf("list = %v", out)
 	}
 }
