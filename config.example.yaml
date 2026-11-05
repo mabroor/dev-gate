@@ -43,11 +43,16 @@ egress_base_allow:
   # OS packages
   - archive.ubuntu.com
   - security.ubuntu.com
+  - deb.debian.org
+  - security.debian.org
   - storage.googleapis.com
   # GitHub (git itself goes through the git proxy)
   - github.com
   - codeload.github.com
   - objects.githubusercontent.com
+  # Install scripts and the REST API (gh, release lookups)
+  - raw.githubusercontent.com
+  - api.github.com
   # Anthropic (code.claude.com/docs/en/network-config): API, claude.ai sign-in
   # (claude.com redirects to claude.ai; platform.claude.com does the OAuth token
   # exchange and refresh) and native updates. mcp-proxy.anthropic.com stays off:
