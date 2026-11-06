@@ -59,6 +59,7 @@ type putRequest struct {
 	Repos       []string `json:"repos"`
 	EgressExtra []string `json:"egress_extra"`
 	EgressOpen  bool     `json:"egress_open"`
+	CILogs      bool     `json:"ci_logs"`
 }
 
 func (h *handler) put(w http.ResponseWriter, r *http.Request) {
@@ -81,12 +82,12 @@ func (h *handler) put(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "token_sha256 must be 64 hex characters", http.StatusBadRequest)
 		return
 	}
-	e := registry.Entry{Project: project, VMIP: ip.Unmap(), Repos: in.Repos, EgressExtra: in.EgressExtra, EgressOpen: in.EgressOpen}
+	e := registry.Entry{Project: project, VMIP: ip.Unmap(), Repos: in.Repos, EgressExtra: in.EgressExtra, EgressOpen: in.EgressOpen, CILogs: in.CILogs}
 	copy(e.TokenSHA256[:], hash)
 
 	switch err := h.reg.Put(e); {
 	case err == nil:
-		slog.Info("admin: project registered", "project", project, "ip", e.VMIP, "repos", len(e.Repos), "egress_open", e.EgressOpen)
+		slog.Info("admin: project registered", "project", project, "ip", e.VMIP, "repos", len(e.Repos), "egress_open", e.EgressOpen, "ci_logs", e.CILogs)
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, registry.ErrInvalid):
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -101,9 +102,10 @@ func (h *handler) put(w http.ResponseWriter, r *http.Request) {
 type patchRequest struct {
 	EgressExtra []string `json:"egress_extra"`
 	EgressOpen  bool     `json:"egress_open"`
+	CILogs      bool     `json:"ci_logs"`
 }
 
-// patch changes only a registered project's egress, so CD can apply
+// patch changes only a registered project's policy (egress, CI logs), so CD can apply
 // projects.yaml without the VM token that PUT needs.
 func (h *handler) patch(w http.ResponseWriter, r *http.Request) {
 	project := r.PathValue("project")
@@ -115,9 +117,9 @@ func (h *handler) patch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "malformed request body", http.StatusBadRequest)
 		return
 	}
-	switch err := h.reg.SetEgress(project, in.EgressExtra, in.EgressOpen); {
+	switch err := h.reg.SetPolicy(project, registry.Policy{EgressExtra: in.EgressExtra, EgressOpen: in.EgressOpen, CILogs: in.CILogs}); {
 	case err == nil:
-		slog.Info("admin: project egress set", "project", project, "egress_extra", len(in.EgressExtra), "egress_open", in.EgressOpen)
+		slog.Info("admin: project policy set", "project", project, "egress_extra", len(in.EgressExtra), "egress_open", in.EgressOpen, "ci_logs", in.CILogs)
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, registry.ErrNotFound):
 		http.Error(w, err.Error(), http.StatusNotFound)
@@ -146,13 +148,14 @@ type listItem struct {
 	Repos       []string `json:"repos"`
 	EgressExtra []string `json:"egress_extra"`
 	EgressOpen  bool     `json:"egress_open"`
+	CILogs      bool     `json:"ci_logs"`
 }
 
 func (h *handler) list(w http.ResponseWriter, _ *http.Request) {
 	entries := h.reg.List()
 	out := make([]listItem, 0, len(entries))
 	for _, e := range entries {
-		out = append(out, listItem{e.Project, e.VMIP.String(), orEmpty(e.Repos), orEmpty(e.EgressExtra), e.EgressOpen})
+		out = append(out, listItem{e.Project, e.VMIP.String(), orEmpty(e.Repos), orEmpty(e.EgressExtra), e.EgressOpen, e.CILogs})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)

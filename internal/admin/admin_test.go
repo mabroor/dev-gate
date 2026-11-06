@@ -231,14 +231,31 @@ func TestAdminPatchEgressKeepsRegistration(t *testing.T) {
 			t.Fatalf("PATCH %s: %d, want 400", bad, resp.StatusCode)
 		}
 	}
-	if resp := e.req(t, "PATCH", "/admin/projects/p", adminTok, `{"egress_extra":["ffmpeg.org"],"egress_open":true}`); resp.StatusCode != http.StatusNoContent {
+	if resp := e.req(t, "PATCH", "/admin/projects/p", adminTok, `{"egress_extra":["ffmpeg.org"],"egress_open":true,"ci_logs":true}`); resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("PATCH: %d, want 204", resp.StatusCode)
 	}
 	p, _ := e.reg.ByIP(netip.MustParseAddr("127.0.0.1"))
-	if !p.EgressOpen || len(p.EgressExtra) != 1 || p.EgressExtra[0] != "ffmpeg.org" || len(p.Repos) != 1 {
+	if !p.EgressOpen || !p.CILogs || len(p.EgressExtra) != 1 || p.EgressExtra[0] != "ffmpeg.org" || len(p.Repos) != 1 {
 		t.Fatalf("after PATCH: %+v", p)
 	}
 	if got := e.gitInfoRefs(t, vmTok); got != http.StatusOK {
 		t.Fatalf("git auth after PATCH: %d, want 200", got)
+	}
+}
+
+func TestAdminPutAndListCILogs(t *testing.T) {
+	e := newEnv(t)
+	body := `{"vm_ip":"10.0.0.2","token_sha256":"` + tokHash(vmTok) + `","repos":["acme/widgets"],"egress_extra":[],"ci_logs":true}`
+	if resp := e.req(t, "PUT", "/admin/projects/p", adminTok, body); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("PUT status %d", resp.StatusCode)
+	}
+	e.req(t, "PUT", "/admin/projects/q", adminTok, putBody("10.0.0.3", "other"))
+	resp := e.req(t, "GET", "/admin/projects", adminTok, "")
+	var out []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || len(out) != 2 {
+		t.Fatalf("list: %v %v", out, err)
+	}
+	if out[0]["ci_logs"] != true || out[1]["ci_logs"] != false {
+		t.Fatalf("list = %v", out)
 	}
 }

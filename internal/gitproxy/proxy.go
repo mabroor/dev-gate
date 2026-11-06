@@ -20,6 +20,7 @@ import (
 
 	"github.com/mabroor/dev-gate/internal/pktline"
 	"github.com/mabroor/dev-gate/internal/registry"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -50,11 +51,14 @@ type proxy struct {
 	upstream *url.URL
 	api      *url.URL
 	client   *http.Client
+	ciCache  ciCache
+	ciLimit  ciLimiter
+	ciFlight singleflight.Group
 }
 
 // Handler serves /<owner>/<repo>[.git]/{info/refs,git-upload-pack,git-receive-pack}
 // by proxying to upstream (https://github.com in production).
-// It also serves POST /pr (see pr.go).
+// It also serves POST /pr (see pr.go) and GET /ci (see ci.go).
 func Handler(reg *registry.Store, mint TokenSource, upstream *url.URL, opts ...Option) http.Handler {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.ResponseHeaderTimeout = 0 // receive-pack answers only after the whole pack arrives
@@ -100,6 +104,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if r.URL.Path == "/pr" {
 		p.pr(w, r, entry)
+		return
+	}
+	if r.URL.Path == "/ci" {
+		p.ci(w, r, entry)
 		return
 	}
 	repo, endpoint, ok := parsePath(r.URL.Path)

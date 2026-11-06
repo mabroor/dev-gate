@@ -192,3 +192,24 @@ func TestParseKey(t *testing.T) {
 		t.Error("expected error for non-PEM")
 	}
 }
+
+func TestMinterCITokenIsReadOnlyAndCachedSeparately(t *testing.T) {
+	m, gh, _ := setup(t)
+	ctx := context.Background()
+	r, _ := m.Token(ctx, "acme/widgets", false)
+	c, err := m.CIToken(ctx, "acme/widgets")
+	if err != nil || c == "" {
+		t.Fatalf("ci token %q err=%v", c, err)
+	}
+	p := gh.mints[len(gh.mints)-1].Permissions
+	if p["actions"] != "read" || p["checks"] != "read" || p["contents"] != "read" || len(p) != 3 {
+		t.Fatalf("ci permissions = %v", p)
+	}
+	n := len(gh.mints)
+	if again, _ := m.CIToken(ctx, "acme/widgets"); again != c || len(gh.mints) != n {
+		t.Fatal("ci token not cached")
+	}
+	if r2, _ := m.Token(ctx, "acme/widgets", false); r2 != r {
+		t.Fatal("read token replaced by the ci token")
+	}
+}

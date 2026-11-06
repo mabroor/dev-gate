@@ -92,6 +92,10 @@ type Entry struct {
 	// EgressOpen lets the project's VM reach any public host, not just the
 	// allowlist. Private, loopback and link-local addresses stay refused.
 	EgressOpen bool
+	// CILogs lets the VM read failed-job log tails through GET /ci. Off by
+	// default: turn it on only when the project's CI gives agent runs no
+	// secrets.
+	CILogs bool
 }
 
 // wire is the on-disk form; the token hash is hex rather than a number array.
@@ -102,10 +106,11 @@ type wire struct {
 	Repos       []string   `json:"repos"`
 	EgressExtra []string   `json:"egress_extra"`
 	EgressOpen  bool       `json:"egress_open,omitempty"`
+	CILogs      bool       `json:"ci_logs,omitempty"`
 }
 
 func (e Entry) MarshalJSON() ([]byte, error) {
-	return json.Marshal(wire{e.Project, e.VMIP, hex.EncodeToString(e.TokenSHA256[:]), e.Repos, e.EgressExtra, e.EgressOpen})
+	return json.Marshal(wire{e.Project, e.VMIP, hex.EncodeToString(e.TokenSHA256[:]), e.Repos, e.EgressExtra, e.EgressOpen, e.CILogs})
 }
 
 func (e *Entry) UnmarshalJSON(b []byte) error {
@@ -117,7 +122,7 @@ func (e *Entry) UnmarshalJSON(b []byte) error {
 	if err != nil || len(h) != sha256.Size {
 		return errors.New("registry: bad token_sha256")
 	}
-	*e = Entry{Project: w.Project, VMIP: w.VMIP, Repos: w.Repos, EgressExtra: w.EgressExtra, EgressOpen: w.EgressOpen}
+	*e = Entry{Project: w.Project, VMIP: w.VMIP, Repos: w.Repos, EgressExtra: w.EgressExtra, EgressOpen: w.EgressOpen, CILogs: w.CILogs}
 	copy(e.TokenSHA256[:], h)
 	return nil
 }
@@ -221,10 +226,16 @@ func (s *Store) Put(e Entry) error {
 	return nil
 }
 
-// SetEgress replaces a registered project's egress settings and keeps its VM
-// address, token and repos, so the egress policy can change without the VM's
-// token.
-func (s *Store) SetEgress(project string, extra []string, open bool) error {
+// Policy is the part of an entry that CD may change without the VM token.
+type Policy struct {
+	EgressExtra []string
+	EgressOpen  bool
+	CILogs      bool
+}
+
+// SetPolicy replaces a registered project's policy and keeps its VM address,
+// token and repos, so the policy can change without the VM's token.
+func (s *Store) SetPolicy(project string, p Policy) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	prev, ok := s.byP[project]
@@ -232,8 +243,9 @@ func (s *Store) SetEgress(project string, extra []string, open bool) error {
 		return ErrNotFound
 	}
 	e := prev.clone()
-	e.EgressExtra = append([]string(nil), extra...)
-	e.EgressOpen = open
+	e.EgressExtra = append([]string(nil), p.EgressExtra...)
+	e.EgressOpen = p.EgressOpen
+	e.CILogs = p.CILogs
 	if err := validate(e); err != nil {
 		return err
 	}
