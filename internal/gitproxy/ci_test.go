@@ -118,7 +118,7 @@ func newCIEnv(t *testing.T, ciLogs bool, mint TokenSource) *ciEnv {
 	t.Cleanup(srv.Close)
 	fm, _ := mint.(*fakeMint)
 	gh.set(ciRef, 200, `{"object":{"sha":"abc123"}}`)
-	gh.set(ciRuns, 200, `{"workflow_runs":[{"id":11,"name":"CI","event":"pull_request","status":"completed","conclusion":"success","html_url":"https://github.com/acme/widgets/actions/runs/11"}]}`)
+	gh.set(ciRuns, 200, `{"workflow_runs":[{"id":11,"name":"CI","head_branch":"agent/fix","head_repository":{"full_name":"acme/widgets"},"event":"pull_request","status":"completed","conclusion":"success","html_url":"https://github.com/acme/widgets/actions/runs/11"}]}`)
 	gh.set(ciJobs, 200, `{"jobs":[{"id":21,"name":"test","status":"completed","conclusion":"success","html_url":"j21","steps":[{"name":"make test","conclusion":"success"}]}]}`)
 	gh.set(ciChecks, 200, `{"check_runs":[{"name":"test","status":"completed","conclusion":"success","app":{"slug":"github-actions"}},{"name":"codecov","status":"completed","conclusion":"success","html_url":"c1","app":{"slug":"codecov"}}]}`)
 	return &ciEnv{&env{srv, up, fm}, gh}
@@ -160,7 +160,7 @@ func TestCISuccessDropsActionsChecks(t *testing.T) {
 
 func TestCIFailureWithLogTail(t *testing.T) {
 	e := newCIEnv(t, true, nil)
-	e.gh.set(ciRuns, 200, `{"workflow_runs":[{"id":11,"name":"CI","event":"push","status":"completed","conclusion":"failure"}]}`)
+	e.gh.set(ciRuns, 200, `{"workflow_runs":[{"id":11,"name":"CI","head_branch":"agent/fix","head_repository":{"full_name":"acme/widgets"},"event":"push","status":"completed","conclusion":"failure"}]}`)
 	e.gh.set(ciJobs, 200, `{"jobs":[{"id":21,"name":"test","status":"completed","conclusion":"failure","steps":[{"name":"checkout","conclusion":"success"},{"name":"make test","conclusion":"failure"}]}]}`)
 	e.gh.redirect(ciLog, "/blob/21")
 	e.gh.set("/blob/21", 200, strings.Repeat("x", 100<<10)+"BOOM")
@@ -214,7 +214,7 @@ func TestCIRefusesBadBranchAndRepo(t *testing.T) {
 
 func TestCIStates(t *testing.T) {
 	e := newCIEnv(t, false, nil)
-	e.gh.set(ciRuns, 200, `{"workflow_runs":[{"id":11,"name":"CI","status":"in_progress"}]}`)
+	e.gh.set(ciRuns, 200, `{"workflow_runs":[{"id":11,"name":"CI","head_branch":"agent/fix","head_repository":{"full_name":"acme/widgets"},"event":"push","status":"in_progress"}]}`)
 	e.gh.set(ciJobs, 200, `{"jobs":[{"id":21,"name":"test","status":"queued"}]}`)
 	if _, res := e.get(t, ciQuery); res.State != "pending" {
 		t.Fatalf("state %q, want pending", res.State)
@@ -275,6 +275,86 @@ func TestReadTail(t *testing.T) {
 		got, err := readTail(strings.NewReader(c.in), c.n)
 		if err != nil || got != c.want {
 			t.Errorf("readTail(%d bytes, %d) = %q, %v", len(c.in), c.n, got, err)
+		}
+	}
+}
+
+// Review finding 1: runs are looked up by commit, so a VM could point an agent
+// branch at main's commit and read main's runs. Only runs of this branch, from
+// this repo, for push or pull_request, may come back.
+func TestCIOnlyReturnsRunsOfTheAgentBranch(t *testing.T) {
+	e := newCIEnv(t, true, nil)
+	e.gh.set(ciRuns, 200, `{"workflow_runs":[
+		{"id":11,"name":"CI","event":"push","head_branch":"agent/fix","head_repository":{"full_name":"acme/widgets"},"status":"completed","conclusion":"failure"},
+		{"id":12,"name":"Deploy","event":"push","head_branch":"main","head_repository":{"full_name":"acme/widgets"},"status":"completed","conclusion":"failure"},
+		{"id":13,"name":"Release","event":"workflow_dispatch","head_branch":"agent/fix","head_repository":{"full_name":"acme/widgets"},"status":"completed","conclusion":"failure"},
+		{"id":14,"name":"Fork","event":"pull_request","head_branch":"agent/fix","head_repository":{"full_name":"evil/widgets"},"status":"completed","conclusion":"failure"}]}`)
+	e.gh.set(ciJobs, 200, `{"jobs":[{"id":21,"name":"test","status":"completed","conclusion":"failure"}]}`)
+	e.gh.redirect(ciLog, "/blob/21")
+	e.gh.set("/blob/21", 200, "log")
+	resp, res := e.get(t, ciQuery+"&logs=1")
+	if resp.StatusCode != 200 || len(res.Runs) != 1 || res.Runs[0].Workflow != "CI" {
+		t.Fatalf("status %d runs %+v", resp.StatusCode, res.Runs)
+	}
+	for _, p := range []string{"/repos/acme/widgets/actions/runs/12/jobs", "/repos/acme/widgets/actions/runs/13/jobs", "/repos/acme/widgets/actions/runs/14/jobs"} {
+		if _, seen := e.gh.auth[p]; seen {
+			t.Errorf("fetched jobs of a foreign run: %s", p)
+		}
+	}
+}
+
+// Review finding 2: a failed log download must not put the signed URL in the
+// response.
+func TestCILogErrorDoesNotLeakURL(t *testing.T) {
+	e := newCIEnv(t, true, nil)
+	e.gh.set(ciRuns, 200, `{"workflow_runs":[{"id":11,"name":"CI","event":"push","head_branch":"agent/fix","head_repository":{"full_name":"acme/widgets"},"status":"completed","conclusion":"failure"}]}`)
+	e.gh.set(ciJobs, 200, `{"jobs":[{"id":21,"name":"test","status":"completed","conclusion":"failure"}]}`)
+	e.gh.redirect(ciLog, "/blob/21?sig=SECRETSIG")
+	e.gh.set("/blob/21", 500, "")
+	_, res := e.get(t, ciQuery+"&logs=1")
+	if tail := res.Runs[0].Jobs[0].LogTail; strings.Contains(tail, "SECRETSIG") || strings.Contains(tail, "/blob/") {
+		t.Fatalf("log tail leaks the URL: %q", tail)
+	}
+}
+
+// Review finding 3: uncached lookups are rate limited per project.
+func TestCIRateLimitsUncachedLookups(t *testing.T) {
+	e := newCIEnv(t, false, nil)
+	limited := false
+	for i := 0; i < ciRateBurst+3; i++ {
+		resp, _ := e.get(t, "repo=acme/widgets&branch=agent/b"+string(rune('a'+i)))
+		if resp.StatusCode == http.StatusTooManyRequests {
+			limited = true
+			break
+		}
+	}
+	if !limited {
+		t.Fatal("no 429 after the burst")
+	}
+}
+
+// Review finding 6: dot segments alias another branch.
+func TestCIRejectsDotSegments(t *testing.T) {
+	e := newCIEnv(t, false, nil)
+	for _, b := range []string{"agent/./fix", "agent/fix/.", "agent/fix.", "agent/."} {
+		if resp, _ := e.get(t, "repo=acme/widgets&branch="+b); resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s: status %d, want 403", b, resp.StatusCode)
+		}
+	}
+}
+
+// Review finding 7: the log is fetched only from GitHub's log hosts.
+func TestCILogHostAllowlist(t *testing.T) {
+	for host, want := range map[string]bool{
+		"productionresultssa1.blob.core.windows.net":     true,
+		"pipelines.actions.githubusercontent.com":        true,
+		"results-receiver.actions.githubusercontent.com": true,
+		"evil.example.com":                               false,
+		"10.0.0.1":                                       false,
+		"blob.core.windows.net.evil.com":                 false,
+	} {
+		if got := allowedLogHost(host); got != want {
+			t.Errorf("allowedLogHost(%q) = %v, want %v", host, got, want)
 		}
 	}
 }

@@ -8,8 +8,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,13 +27,23 @@ type CITokenSource interface {
 
 const (
 	ciCacheTTL     = 15 * time.Second
+	ciErrorTTL     = 5 * time.Second // unknown branches and upstream errors
+	ciCacheMax     = 256
 	ciMaxRuns      = 20
 	ciMaxJobs      = 50
 	ciMaxLogJobs   = 5
 	ciLogTailBytes = 64 << 10
-	ciMaxLogBytes  = 64 << 20 // read at most this much of a job log to find its tail
+	ciMaxLogBytes  = 16 << 20 // read at most this much of a job log to find its tail
 	ciMaxAPIBody   = 4 << 20
+	ciTimeout      = 30 * time.Second
+	// ciRateBurst uncached lookups per project per ciRateWindow. The App's
+	// installation rate limit is shared with every project's git traffic.
+	ciRateBurst  = 10
+	ciRateWindow = time.Minute
 )
+
+// ciEvents are the run events an agent branch can trigger by itself.
+var ciEvents = map[string]bool{"push": true, "pull_request": true}
 
 var errUpstreamNotFound = errors.New("upstream: not found")
 
@@ -70,38 +82,100 @@ type ciResult struct {
 	LogsAvailable bool      `json:"logs_available"`
 }
 
-type ciCacheEntry struct {
-	expires time.Time
-	body    []byte
+// ciReply is a finished answer: cached, and shared by concurrent callers.
+type ciReply struct {
+	status int
+	body   []byte
 }
 
+type ciCacheEntry struct {
+	expires time.Time
+	reply   ciReply
+}
+
+// ciCache holds at most ciCacheMax answers; when full, expired entries go
+// first, then the one closest to expiry.
 type ciCache struct {
 	mu sync.Mutex
 	m  map[string]ciCacheEntry
 }
 
-func (c *ciCache) get(key string, now time.Time) ([]byte, bool) {
+func (c *ciCache) get(key string, now time.Time) (ciReply, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.m[key]
 	if !ok || now.After(e.expires) {
-		return nil, false
+		return ciReply{}, false
 	}
-	return e.body, true
+	return e.reply, true
 }
 
-func (c *ciCache) put(key string, body []byte, now time.Time) {
+func (c *ciCache) put(key string, r ciReply, ttl time.Duration, now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.m == nil {
 		c.m = map[string]ciCacheEntry{}
 	}
-	for k, e := range c.m {
-		if now.After(e.expires) {
-			delete(c.m, k)
+	if _, ok := c.m[key]; !ok && len(c.m) >= ciCacheMax {
+		victim, first := "", true
+		for k, e := range c.m {
+			if now.After(e.expires) {
+				delete(c.m, k)
+				continue
+			}
+			if first || e.expires.Before(c.m[victim].expires) {
+				victim, first = k, false
+			}
+		}
+		if len(c.m) >= ciCacheMax {
+			delete(c.m, victim)
 		}
 	}
-	c.m[key] = ciCacheEntry{now.Add(ciCacheTTL), body}
+	c.m[key] = ciCacheEntry{now.Add(ttl), r}
+}
+
+// ciLimiter allows ciRateBurst uncached lookups per project per window.
+type ciLimiter struct {
+	mu sync.Mutex
+	m  map[string]struct {
+		start time.Time
+		n     int
+	}
+}
+
+func (l *ciLimiter) allow(project string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.m == nil {
+		l.m = map[string]struct {
+			start time.Time
+			n     int
+		}{}
+	}
+	w := l.m[project]
+	if now.Sub(w.start) >= ciRateWindow {
+		w.start, w.n = now, 0
+	}
+	if w.n >= ciRateBurst {
+		return false
+	}
+	w.n++
+	l.m[project] = w
+	return true
+}
+
+// ciBranchOK: a plain agent/ branch with no "." segment and no segment ending
+// in ".", so no two names reach the same ref upstream.
+func ciBranchOK(b string) bool {
+	if !validBranch(b) || !pktline.AllAgent([]pktline.RefUpdate{{Ref: "refs/heads/" + b}}) {
+		return false
+	}
+	for _, seg := range strings.Split(b, "/") {
+		if seg == "" || strings.HasSuffix(seg, ".") {
+			return false
+		}
+	}
+	return true
 }
 
 // ci answers GET /ci?repo=&branch=[&logs=1] with the CI state of an agent
@@ -119,7 +193,7 @@ func (p *proxy) ci(w http.ResponseWriter, r *http.Request, e registry.Entry) {
 		return
 	}
 	branch := q.Get("branch")
-	if !validBranch(branch) || !pktline.AllAgent([]pktline.RefUpdate{{Ref: "refs/heads/" + branch}}) {
+	if !ciBranchOK(branch) {
 		http.Error(w, "branch must be a plain branch name under agent/", http.StatusForbidden)
 		return
 	}
@@ -135,30 +209,57 @@ func (p *proxy) ci(w http.ResponseWriter, r *http.Request, e registry.Entry) {
 	}
 
 	key := e.Project + "|" + repo + "|" + branch + "|" + strconv.FormatBool(logs)
-	if body, ok := p.ciCache.get(key, time.Now()); ok {
-		writeJSON(w, body)
+	if rep, ok := p.ciCache.get(key, time.Now()); ok {
+		writeReply(w, rep)
 		return
 	}
-	token, err := mint.CIToken(r.Context(), repo)
+	if !p.ciLimit.allow(e.Project, time.Now()) {
+		slog.Warn("ci: rate limited", "project", e.Project)
+		http.Error(w, "too many CI lookups; wait a minute", http.StatusTooManyRequests)
+		return
+	}
+	v, _, _ := p.ciFlight.Do(key, func() (any, error) {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), ciTimeout)
+		defer cancel()
+		rep, ttl := p.ciAnswer(ctx, mint, e, repo, branch, logs)
+		p.ciCache.put(key, rep, ttl, time.Now())
+		return rep, nil
+	})
+	writeReply(w, v.(ciReply))
+}
+
+// ciAnswer does the upstream work and returns the reply and how long to cache it.
+func (p *proxy) ciAnswer(ctx context.Context, mint CITokenSource, e registry.Entry, repo, branch string, logs bool) (ciReply, time.Duration) {
+	text := func(status int, msg string) (ciReply, time.Duration) {
+		return ciReply{status, []byte(msg + "\n")}, ciErrorTTL
+	}
+	token, err := mint.CIToken(ctx, repo)
 	if err != nil {
 		slog.Error("ci: minting token", "project", e.Project, "repo", repo, "err", err)
-		http.Error(w, "upstream unavailable", http.StatusBadGateway)
-		return
+		return text(http.StatusBadGateway, "upstream unavailable")
 	}
-	res, err := p.ciFetch(r.Context(), token, repo, branch, logs)
+	res, err := p.ciFetch(ctx, token, repo, branch, logs)
 	logCI(e.Project, repo, branch, logs, res, err)
 	switch {
 	case errors.Is(err, errUpstreamNotFound):
-		http.Error(w, "branch not found", http.StatusNotFound)
-		return
+		return text(http.StatusNotFound, "branch not found")
 	case err != nil:
-		http.Error(w, "upstream error", http.StatusBadGateway)
-		return
+		return text(http.StatusBadGateway, "upstream error")
 	}
 	res.LogsAvailable = e.CILogs
 	body, _ := json.Marshal(res)
-	p.ciCache.put(key, body, time.Now())
-	writeJSON(w, body)
+	return ciReply{http.StatusOK, body}, ciCacheTTL
+}
+
+func writeReply(w http.ResponseWriter, rep ciReply) {
+	if rep.status != http.StatusOK {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(rep.status)
+		_, _ = w.Write(rep.body)
+		return
+	}
+	writeJSON(w, rep.body)
 }
 
 func writeJSON(w http.ResponseWriter, body []byte) {
@@ -202,14 +303,22 @@ func (p *proxy) ciFetch(ctx context.Context, token, repo, branch string, logs bo
 			Status     string `json:"status"`
 			Conclusion string `json:"conclusion"`
 			HTMLURL    string `json:"html_url"`
+			HeadBranch string `json:"head_branch"`
+			HeadRepo   struct {
+				FullName string `json:"full_name"`
+			} `json:"head_repository"`
 		} `json:"workflow_runs"`
 	}
 	if err := p.apiGet(ctx, token, "/repos/"+repo+"/actions/runs",
-		url.Values{"head_sha": {sha}, "per_page": {strconv.Itoa(ciMaxRuns)}}, &runs); err != nil {
+		url.Values{"head_sha": {sha}, "branch": {branch}, "per_page": {strconv.Itoa(ciMaxRuns)}}, &runs); err != nil {
 		return nil, notFoundIsUpstream(err)
 	}
 	logJobs := 0
 	for _, wr := range runs.WorkflowRuns {
+		// Only runs this branch triggered itself: the commit may also be main's.
+		if wr.HeadBranch != branch || !ciEvents[wr.Event] || !strings.EqualFold(wr.HeadRepo.FullName, repo) {
+			continue
+		}
 		run := ciRun{Workflow: wr.Name, Event: wr.Event, Status: wr.Status, Conclusion: wr.Conclusion, URL: wr.HTMLURL, Jobs: []ciJob{}}
 		var jobs struct {
 			Jobs []struct {
@@ -240,7 +349,7 @@ func (p *proxy) ciFetch(ctx context.Context, token, repo, branch string, logs bo
 				tail, err := p.jobLogTail(ctx, token, repo, j.ID)
 				if err != nil {
 					slog.Warn("ci: job log", "repo", repo, "job", j.ID, "err", err)
-					tail = "(log unavailable: " + err.Error() + ")"
+					tail = "(log unavailable)"
 				}
 				job.LogTail = tail
 			}
@@ -364,13 +473,19 @@ func (p *proxy) jobLogTail(ctx context.Context, token, repo string, job int64) (
 	if err != nil {
 		return "", err
 	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusFound {
-		return "", fmt.Errorf("status %d", resp.StatusCode)
+		return "", fmt.Errorf("log redirect: status %d", resp.StatusCode)
 	}
 	loc, err := url.Parse(resp.Header.Get("Location"))
-	if err != nil || loc.Host == "" || (loc.Scheme != "https" && loc.Scheme != p.api.Scheme) {
+	if err != nil || loc.Hostname() == "" {
 		return "", errors.New("bad log redirect")
+	}
+	// GitHub's log hosts over https; the API host itself (a test server) too.
+	sameAsAPI := loc.Host == p.api.Host && loc.Scheme == p.api.Scheme
+	if !sameAsAPI && (loc.Scheme != "https" || !allowedLogHost(loc.Hostname())) {
+		return "", errors.New("log redirect to an unexpected host")
 	}
 	lreq, err := http.NewRequestWithContext(ctx, http.MethodGet, loc.String(), nil)
 	if err != nil {
@@ -379,7 +494,12 @@ func (p *proxy) jobLogTail(ctx context.Context, token, repo string, job int64) (
 	lreq.Header.Set("User-Agent", "dev-gate")
 	lresp, err := p.client.Do(lreq)
 	if err != nil {
-		return "", err
+		// A *url.Error carries the signed URL; keep only the cause.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
+		return "", fmt.Errorf("log download: %w", err)
 	}
 	defer lresp.Body.Close()
 	if lresp.StatusCode != http.StatusOK {
@@ -409,4 +529,14 @@ func readTail(r io.Reader, n int) (string, error) {
 		buf = buf[len(buf)-n:]
 	}
 	return string(buf), nil
+}
+
+// allowedLogHost: GitHub serves job logs from Azure blob storage and its own
+// actions hosts. IP literals are never allowed.
+func allowedLogHost(h string) bool {
+	if _, err := netip.ParseAddr(h); err == nil {
+		return false
+	}
+	h = strings.ToLower(h)
+	return strings.HasSuffix(h, ".blob.core.windows.net") || strings.HasSuffix(h, ".githubusercontent.com")
 }

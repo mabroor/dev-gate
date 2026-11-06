@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/sirupsen/logrus v1.9.0
 	github.com/stripe/smokescreen v0.1.0
+	golang.org/x/sync v0.21.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -26,7 +27,6 @@ require (
 	github.com/stripe/goproxy v0.0.0-20260826103935-0cd07c409a76 // indirect
 	golang.org/x/mod v0.37.0 // indirect
 	golang.org/x/net v0.56.0 // indirect
-	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/text v0.39.0 // indirect
 	golang.org/x/tools v0.47.0 // indirect

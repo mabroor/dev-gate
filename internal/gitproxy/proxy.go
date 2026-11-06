@@ -20,6 +20,7 @@ import (
 
 	"github.com/mabroor/dev-gate/internal/pktline"
 	"github.com/mabroor/dev-gate/internal/registry"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -51,6 +52,8 @@ type proxy struct {
 	api      *url.URL
 	client   *http.Client
 	ciCache  ciCache
+	ciLimit  ciLimiter
+	ciFlight singleflight.Group
 }
 
 // Handler serves /<owner>/<repo>[.git]/{info/refs,git-upload-pack,git-receive-pack}
