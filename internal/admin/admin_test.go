@@ -214,3 +214,31 @@ func TestAdminPutAndListEgressOpen(t *testing.T) {
 		t.Fatalf("list = %v", out)
 	}
 }
+
+func TestAdminPatchEgressKeepsRegistration(t *testing.T) {
+	e := newEnv(t)
+	if resp := e.req(t, "PATCH", "/admin/projects/p", adminTok, `{"egress_extra":[]}`); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("PATCH unknown project: %d, want 404", resp.StatusCode)
+	}
+	e.req(t, "PUT", "/admin/projects/p", adminTok, putBody("127.0.0.1", vmTok))
+	for _, tok := range []string{"", "wrong"} {
+		if resp := e.req(t, "PATCH", "/admin/projects/p", tok, `{"egress_extra":[],"egress_open":true}`); resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("PATCH bearer %q: %d, want 401", tok, resp.StatusCode)
+		}
+	}
+	for _, bad := range []string{`{"vm_ip":"10.0.0.9"}`, `{"egress_extra":["Bad Host"]}`, `nope`} {
+		if resp := e.req(t, "PATCH", "/admin/projects/p", adminTok, bad); resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("PATCH %s: %d, want 400", bad, resp.StatusCode)
+		}
+	}
+	if resp := e.req(t, "PATCH", "/admin/projects/p", adminTok, `{"egress_extra":["ffmpeg.org"],"egress_open":true}`); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("PATCH: %d, want 204", resp.StatusCode)
+	}
+	p, _ := e.reg.ByIP(netip.MustParseAddr("127.0.0.1"))
+	if !p.EgressOpen || len(p.EgressExtra) != 1 || p.EgressExtra[0] != "ffmpeg.org" || len(p.Repos) != 1 {
+		t.Fatalf("after PATCH: %+v", p)
+	}
+	if got := e.gitInfoRefs(t, vmTok); got != http.StatusOK {
+		t.Fatalf("git auth after PATCH: %d, want 200", got)
+	}
+}

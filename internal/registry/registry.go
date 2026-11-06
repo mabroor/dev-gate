@@ -21,8 +21,9 @@ import (
 )
 
 // ErrInvalid marks an entry that is malformed; ErrConflict one that collides
-// with another project's IP or token.
+// with another project's IP or token; ErrNotFound an unknown project.
 var (
+	ErrNotFound = errors.New("registry: no such project")
 	ErrInvalid  = errors.New("registry: invalid entry")
 	ErrConflict = errors.New("registry: conflicts with another project")
 )
@@ -215,6 +216,30 @@ func (s *Store) Put(e Entry) error {
 		} else {
 			delete(s.byP, e.Project)
 		}
+		return err
+	}
+	return nil
+}
+
+// SetEgress replaces a registered project's egress settings and keeps its VM
+// address, token and repos, so the egress policy can change without the VM's
+// token.
+func (s *Store) SetEgress(project string, extra []string, open bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev, ok := s.byP[project]
+	if !ok {
+		return ErrNotFound
+	}
+	e := prev.clone()
+	e.EgressExtra = append([]string(nil), extra...)
+	e.EgressOpen = open
+	if err := validate(e); err != nil {
+		return err
+	}
+	s.byP[project] = e
+	if err := s.saveLocked(); err != nil {
+		s.byP[project] = prev
 		return err
 	}
 	return nil
