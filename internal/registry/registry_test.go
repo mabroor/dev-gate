@@ -323,39 +323,39 @@ func TestOpenReadsRegistryWithoutEgressOpen(t *testing.T) {
 	}
 }
 
-func TestSetEgressKeepsTokenAndRepos(t *testing.T) {
+func TestSetPolicyKeepsTokenAndRepos(t *testing.T) {
 	s, path := open(t)
 	if err := s.Put(entry("p", "10.0.0.2", "tok", "acme/widgets")); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetEgress("p", []string{"ffmpeg.org"}, true); err != nil {
+	if err := s.SetPolicy("p", Policy{EgressExtra: []string{"ffmpeg.org"}, EgressOpen: true, CILogs: true}); err != nil {
 		t.Fatal(err)
 	}
 	got, ok := s.ByToken("tok", netip.MustParseAddr("10.0.0.2"))
-	if !ok || len(got.Repos) != 1 || !got.EgressOpen || len(got.EgressExtra) != 1 || got.EgressExtra[0] != "ffmpeg.org" {
-		t.Fatalf("after SetEgress: %+v ok=%v", got, ok)
+	if !ok || len(got.Repos) != 1 || !got.EgressOpen || !got.CILogs || len(got.EgressExtra) != 1 || got.EgressExtra[0] != "ffmpeg.org" {
+		t.Fatalf("after SetPolicy: %+v ok=%v", got, ok)
 	}
 	re, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if e, _ := re.ByIP(netip.MustParseAddr("10.0.0.2")); !e.EgressOpen || e.EgressExtra[0] != "ffmpeg.org" {
+	if e, _ := re.ByIP(netip.MustParseAddr("10.0.0.2")); !e.EgressOpen || !e.CILogs || e.EgressExtra[0] != "ffmpeg.org" {
 		t.Fatalf("not persisted: %+v", e)
 	}
 }
 
-func TestSetEgressUnknownProjectAndInvalidHost(t *testing.T) {
+func TestSetPolicyUnknownProjectAndInvalidHost(t *testing.T) {
 	s, _ := open(t)
-	if err := s.SetEgress("nope", nil, false); !errors.Is(err, ErrNotFound) {
+	if err := s.SetPolicy("nope", Policy{}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown project: err = %v, want ErrNotFound", err)
 	}
 	if err := s.Put(entry("p", "10.0.0.2", "tok", "acme/widgets")); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetEgress("p", []string{"Bad Host"}, false); !errors.Is(err, ErrInvalid) {
+	if err := s.SetPolicy("p", Policy{EgressExtra: []string{"Bad Host"}}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("bad host: err = %v, want ErrInvalid", err)
 	}
 	if e, _ := s.ByIP(netip.MustParseAddr("10.0.0.2")); len(e.EgressExtra) != 1 || e.EgressExtra[0] != "example.com" {
-		t.Fatalf("rejected SetEgress changed the entry: %+v", e)
+		t.Fatalf("rejected SetPolicy changed the entry: %+v", e)
 	}
 }

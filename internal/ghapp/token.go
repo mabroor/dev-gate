@@ -73,15 +73,24 @@ func ParseKey(pemBytes []byte) (*rsa.PrivateKey, error) {
 // repo with contents:read, or contents:write plus pull_requests:write when
 // write is true. Tokens are cached until 10 minutes before they expire.
 func (m *Minter) Token(ctx context.Context, repo string, write bool) (string, error) {
+	if write {
+		return m.mint(ctx, repo, "write", map[string]string{"contents": "write", "pull_requests": "write"})
+	}
+	return m.mint(ctx, repo, "read", map[string]string{"contents": "read"})
+}
+
+// CIToken returns a token for repo that can read its workflow runs, jobs, job
+// logs and check runs, and resolve branches (contents:read). It cannot write.
+func (m *Minter) CIToken(ctx context.Context, repo string) (string, error) {
+	return m.mint(ctx, repo, "ci", map[string]string{"actions": "read", "checks": "read", "contents": "read"})
+}
+
+func (m *Minter) mint(ctx context.Context, repo, kind string, perms map[string]string) (string, error) {
 	owner, name, err := splitRepo(repo)
 	if err != nil {
 		return "", err
 	}
-	key := repo + "|read"
-	if write {
-		key = repo + "|write"
-	}
-	s := m.slot(key)
+	s := m.slot(repo + "|" + kind)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.token != "" && m.now().Before(s.expires.Add(-refreshMargin)) {
@@ -91,10 +100,6 @@ func (m *Minter) Token(ctx context.Context, repo string, write bool) (string, er
 	id, err := m.installation(ctx, owner, name)
 	if err != nil {
 		return "", err
-	}
-	perms := map[string]string{"contents": "read"}
-	if write {
-		perms = map[string]string{"contents": "write", "pull_requests": "write"}
 	}
 	var resp struct {
 		Token     string    `json:"token"`
