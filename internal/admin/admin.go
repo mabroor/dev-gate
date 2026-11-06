@@ -32,6 +32,7 @@ func New(reg *registry.Store, adminToken string) (http.Handler, error) {
 	h := &handler{reg: reg, tokenHash: sha256.Sum256([]byte(adminToken))}
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /admin/projects/{project}", h.auth(h.put))
+	mux.HandleFunc("PATCH /admin/projects/{project}", h.auth(h.patch))
 	mux.HandleFunc("DELETE /admin/projects/{project}", h.auth(h.delete))
 	mux.HandleFunc("GET /admin/projects", h.auth(h.list))
 	return mux, nil
@@ -91,6 +92,37 @@ func (h *handler) put(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, registry.ErrConflict):
 		http.Error(w, err.Error(), http.StatusConflict)
+	default:
+		slog.Error("admin: saving registry", "project", project, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}
+}
+
+type patchRequest struct {
+	EgressExtra []string `json:"egress_extra"`
+	EgressOpen  bool     `json:"egress_open"`
+}
+
+// patch changes only a registered project's egress, so CD can apply
+// projects.yaml without the VM token that PUT needs.
+func (h *handler) patch(w http.ResponseWriter, r *http.Request) {
+	project := r.PathValue("project")
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+	var in patchRequest
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil || dec.More() {
+		http.Error(w, "malformed request body", http.StatusBadRequest)
+		return
+	}
+	switch err := h.reg.SetEgress(project, in.EgressExtra, in.EgressOpen); {
+	case err == nil:
+		slog.Info("admin: project egress set", "project", project, "egress_extra", len(in.EgressExtra), "egress_open", in.EgressOpen)
+		w.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, registry.ErrNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+	case errors.Is(err, registry.ErrInvalid):
+		http.Error(w, err.Error(), http.StatusBadRequest)
 	default:
 		slog.Error("admin: saving registry", "project", project, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
